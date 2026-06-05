@@ -1,0 +1,399 @@
+// ── Amalgame.Database.Migrate ────────────────────────────────
+//
+// A small, safe schema-migration runner for amalgame-database-sqlite.
+// You register ordered migrations (each with an `up` and an optional
+// `down` SQL block); the runner tracks which have been applied in a
+// `schema_migrations` table and brings the database forward (or back)
+// one transaction at a time.
+//
+// Safety is the whole point of a migration tool, so the runner is
+// strict by construction:
+//   - migrations run in ascending version order, regardless of the
+//     order you registered them;
+//   - each migration runs inside its OWN transaction — on any error
+//     the runner rolls that migration back and STOPS, so the schema
+//     never drifts into a half-applied state;
+//   - already-applied versions are skipped (re-running Up is a no-op);
+//   - a `down` rollback refuses to run a migration that declared no
+//     down SQL (an irreversible step must be explicit, not silent);
+//   - the tracking-table name is validated as a plain identifier, and
+//     the applied-version record is written with bound parameters.
+//
+// Usage:
+//   import Amalgame.Database.SQLite
+//   import Amalgame.Database.Migrate
+//
+//   let db = SQLite.Open("app.db")
+//   let m  = new Migrator()
+//   m.Add(1, "create_users",
+//         "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE)",
+//         "DROP TABLE users")
+//   m.Add(2, "add_users_name",
+//         "ALTER TABLE users ADD COLUMN name TEXT",
+//         "")                          // "" → irreversible (no down)
+//   let r = m.Up(db)
+//   if (!r.Ok) { Console.WriteLine("migration failed: " + r.Error) }
+//   // r.Applied = [1, 2] ; m.Current(db) == 2
+
+namespace Amalgame.Database.Migrate
+
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Database.SQLite
+
+@c {
+    #include <time.h>
+    #include <stdlib.h>
+    #include <string.h>
+}
+
+// ── Migration ────────────────────────────────────────────────
+public class Migration {
+    public Version: int
+    public Name:    string
+    public Up:      string
+    public Down:    string       // "" = irreversible
+
+    public Migration(version: int, name: string, up: string, down: string) {
+        this.Version = version
+        this.Name    = name
+        this.Up      = up
+        this.Down    = down
+    }
+}
+
+// ── MigrateResult ────────────────────────────────────────────
+public class MigrateResult {
+    public Ok:         bool
+    public Applied:    List<int>     // versions applied this call (Up)
+    public RolledBack: List<int>     // versions rolled back this call (Down)
+    public Error:      string
+    public Message:    string
+
+    public MigrateResult() {
+        this.Ok         = false
+        this.Applied    = new List<int>()
+        this.RolledBack = new List<int>()
+        this.Error      = ""
+        this.Message    = ""
+    }
+}
+
+// ── Migrator ─────────────────────────────────────────────────
+public class Migrator {
+    public Migrations: List<Migration>
+    public Table:      string
+
+    public Migrator() {
+        this.Migrations = new List<Migration>()
+        this.Table      = "schema_migrations"
+    }
+
+    // Override the tracking-table name. Rejected (kept as-is) if it
+    // isn't a plain identifier — the name is interpolated into DDL, so
+    // we never let an odd value through.
+    public Migrator WithTable(name: string) {
+        if (Migrator.IsIdent(name)) { this.Table = name }
+        return this
+    }
+
+    public Migrator Add(version: int, name: string, up: string, down: string) {
+        this.Migrations.Add(new Migration(version, name, up, down))
+        return this
+    }
+    public Migrator AddMigration(m: Migration) {
+        this.Migrations.Add(m)
+        return this
+    }
+
+    // ── Up ───────────────────────────────────────────────────
+    // Apply every pending migration in ascending version order. Each
+    // runs in its own transaction; the first failure rolls back and
+    // stops (no partial schema drift). Idempotent: already-applied
+    // versions are skipped, so re-running is safe.
+    public MigrateResult Up(db: SQLite) {
+        let res = new MigrateResult()
+        if (!SQLite.IsOpen(db)) { res.Error = "database is not open"; return res }
+        if (!this.ensureTable(db)) {
+            res.Error = "cannot create tracking table: " + SQLite.LastError(db)
+            return res
+        }
+        let sorted: List<Migration> = this.sorted()
+        let dup: int = Migrator.FirstDuplicate(sorted)
+        if (dup >= 0) {
+            res.Error = "duplicate migration version " + String_FromInt(dup)
+            return res
+        }
+        let done: List<int> = this.appliedVersions(db)
+        let n: int = sorted.Count()
+        for i in 0..n {
+            let mig: Migration = sorted.Get(i)
+            if (Migrator.Contains(done, mig.Version)) { continue }
+
+            if (!SQLite.Begin(db)) {
+                res.Error = "begin failed before v" + String_FromInt(mig.Version)
+                    + ": " + SQLite.LastError(db)
+                return res
+            }
+            if (!SQLite.Exec(db, mig.Up)) {
+                let e: string = SQLite.LastError(db)
+                SQLite.Rollback(db)
+                res.Error = "migration v" + String_FromInt(mig.Version)
+                    + " (" + mig.Name + ") failed: " + e
+                return res
+            }
+            if (!this.recordApplied(db, mig)) {
+                let e: string = SQLite.LastError(db)
+                SQLite.Rollback(db)
+                res.Error = "recording v" + String_FromInt(mig.Version) + " failed: " + e
+                return res
+            }
+            if (!SQLite.Commit(db)) {
+                let e: string = SQLite.LastError(db)
+                SQLite.Rollback(db)
+                res.Error = "commit v" + String_FromInt(mig.Version) + " failed: " + e
+                return res
+            }
+            res.Applied.Add(mig.Version)
+        }
+        res.Ok = true
+        res.Message = "applied " + String_FromInt(res.Applied.Count()) + " migration(s)"
+        return res
+    }
+
+    // ── Down ─────────────────────────────────────────────────
+    // Roll back the single most-recently-applied migration. Refuses
+    // (with an error) if that migration declared no down SQL, or if
+    // there is no registered definition for the applied version.
+    public MigrateResult Down(db: SQLite) {
+        let res = new MigrateResult()
+        if (!SQLite.IsOpen(db)) { res.Error = "database is not open"; return res }
+        if (!this.ensureTable(db)) {
+            res.Error = "cannot create tracking table: " + SQLite.LastError(db)
+            return res
+        }
+        let cur: int = this.Current(db)
+        if (cur == 0) {
+            res.Ok = true
+            res.Message = "nothing to roll back"
+            return res
+        }
+        let mig: Migration = this.find(cur)
+        if (mig.Version != cur) {
+            res.Error = "no migration definition for applied v" + String_FromInt(cur)
+                + " — cannot roll back safely"
+            return res
+        }
+        if (String_Length(mig.Down) == 0) {
+            res.Error = "migration v" + String_FromInt(cur) + " (" + mig.Name
+                + ") is irreversible (no down SQL)"
+            return res
+        }
+        if (!SQLite.Begin(db)) {
+            res.Error = "begin failed: " + SQLite.LastError(db); return res
+        }
+        if (!SQLite.Exec(db, mig.Down)) {
+            let e: string = SQLite.LastError(db)
+            SQLite.Rollback(db)
+            res.Error = "down v" + String_FromInt(cur) + " failed: " + e
+            return res
+        }
+        let params = new List<string>()
+        params.Add(String_FromInt(cur))
+        if (!SQLite.ExecBind(db, "DELETE FROM " + this.Table + " WHERE version = ?", params)) {
+            let e: string = SQLite.LastError(db)
+            SQLite.Rollback(db)
+            res.Error = "down bookkeeping v" + String_FromInt(cur) + " failed: " + e
+            return res
+        }
+        if (!SQLite.Commit(db)) {
+            let e: string = SQLite.LastError(db)
+            SQLite.Rollback(db)
+            res.Error = "commit down v" + String_FromInt(cur) + " failed: " + e
+            return res
+        }
+        res.RolledBack.Add(cur)
+        res.Ok = true
+        res.Message = "rolled back v" + String_FromInt(cur)
+        return res
+    }
+
+    // Roll back repeatedly until the current version is ≤ `target`.
+    // Stops + returns on the first failure (partial RolledBack list
+    // still reflects what was undone).
+    public MigrateResult DownTo(db: SQLite, target: int) {
+        let res = new MigrateResult()
+        res.Ok = true
+        while (this.Current(db) > target) {
+            let step: MigrateResult = this.Down(db)
+            if (!step.Ok) {
+                step.RolledBack = res.RolledBack
+                return step
+            }
+            let m: int = step.RolledBack.Count()
+            for i in 0..m { res.RolledBack.Add(step.RolledBack.Get(i)) }
+        }
+        res.Message = "rolled back " + String_FromInt(res.RolledBack.Count()) + " migration(s)"
+        return res
+    }
+
+    // ── Introspection ────────────────────────────────────────
+    // Highest applied version, or 0 if none / table absent.
+    public int Current(db: SQLite) {
+        if (!this.ensureTable(db)) { return 0 }
+        let rows: List<List<string>> = SQLite.QueryAll(db,
+            "SELECT version FROM " + this.Table + " ORDER BY version DESC LIMIT 1")
+        if (rows.Count() == 0) { return 0 }
+        let row: List<string> = rows.Get(0)
+        if (row.Count() == 0) { return 0 }
+        return Migrator.ParseInt(row.Get(0))
+    }
+
+    // Versions registered but not yet applied, ascending.
+    public List<int> Pending(db: SQLite) {
+        let out = new List<int>()
+        let done: List<int> = this.appliedVersions(db)
+        let sorted: List<Migration> = this.sorted()
+        let n: int = sorted.Count()
+        for i in 0..n {
+            let mig: Migration = sorted.Get(i)
+            if (!Migrator.Contains(done, mig.Version)) { out.Add(mig.Version) }
+        }
+        return out
+    }
+
+    // ── internals ────────────────────────────────────────────
+
+    private bool ensureTable(db: SQLite) {
+        return SQLite.Exec(db,
+            "CREATE TABLE IF NOT EXISTS " + this.Table
+            + " (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)")
+    }
+
+    private bool recordApplied(db: SQLite, mig: Migration) {
+        let params = new List<string>()
+        params.Add(String_FromInt(mig.Version))
+        params.Add(mig.Name)
+        params.Add(Migrator.NowUtc())
+        return SQLite.ExecBind(db,
+            "INSERT INTO " + this.Table + " (version, name, applied_at) VALUES (?, ?, ?)",
+            params)
+    }
+
+    private List<int> appliedVersions(db: SQLite) {
+        let out = new List<int>()
+        if (!this.ensureTable(db)) { return out }
+        let rows: List<List<string>> = SQLite.QueryAll(db,
+            "SELECT version FROM " + this.Table + " ORDER BY version")
+        let n: int = rows.Count()
+        for i in 0..n {
+            let row: List<string> = rows.Get(i)
+            if (row.Count() > 0) { out.Add(Migrator.ParseInt(row.Get(0))) }
+        }
+        return out
+    }
+
+    // A version-sorted COPY of the registered migrations (selection
+    // sort — migration counts are small).
+    private List<Migration> sorted() {
+        let xs = new List<Migration>()
+        let n: int = this.Migrations.Count()
+        for i in 0..n { xs.Add(this.Migrations.Get(i)) }
+        var a: int = 0
+        while (a < n) {
+            var lo: int = a
+            var b: int = a + 1
+            while (b < n) {
+                let mb:  Migration = xs.Get(b)
+                let mlo: Migration = xs.Get(lo)
+                if (mb.Version < mlo.Version) { lo = b }
+                b = b + 1
+            }
+            if (lo != a) {
+                let tmp: Migration = xs.Get(a)
+                xs.Set(a, xs.Get(lo))
+                xs.Set(lo, tmp)
+            }
+            a = a + 1
+        }
+        return xs
+    }
+
+    // Registered migration for a version, or a sentinel whose Version
+    // != the asked version when not found.
+    private Migration find(version: int) {
+        let n: int = this.Migrations.Count()
+        for i in 0..n {
+            let m: Migration = this.Migrations.Get(i)
+            if (m.Version == version) { return m }
+        }
+        return new Migration(-1, "", "", "")
+    }
+
+    // ── static helpers ───────────────────────────────────────
+
+    private static bool Contains(xs: List<int>, v: int) {
+        let n: int = xs.Count()
+        for i in 0..n { if (xs.Get(i) == v) { return true } }
+        return false
+    }
+
+    // First duplicated version in a sorted list, or -1 if all unique.
+    private static int FirstDuplicate(sorted: List<Migration>) {
+        let n: int = sorted.Count()
+        var i: int = 1
+        while (i < n) {
+            let mi: Migration = sorted.Get(i)
+            let mp: Migration = sorted.Get(i - 1)
+            if (mi.Version == mp.Version) { return mi.Version }
+            i = i + 1
+        }
+        return -1
+    }
+
+    // Plain SQL identifier: starts with a letter / underscore, then
+    // letters / digits / underscores. Bounds the tracking-table name.
+    private static bool IsIdent(s: string) {
+        var ok: bool = false
+        @c {
+            const char* p = (const char*) s;
+            if (p && *p) {
+                char c0 = p[0];
+                int okStart = (c0 == '_') || (c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z');
+                if (okStart) {
+                    int bad = 0;
+                    for (const char* q = p + 1; *q; q++) {
+                        char c = *q;
+                        int good = (c == '_') || (c >= 'a' && c <= 'z')
+                                 || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+                        if (!good) { bad = 1; break; }
+                    }
+                    ok = !bad;
+                }
+            }
+        }
+        return ok
+    }
+
+    private static int ParseInt(s: string) {
+        var out: int = 0
+        @c { if (s) { out = (int64_t) strtoll(s, NULL, 10); } }
+        return out
+    }
+
+    // "YYYY-MM-DD HH:MM:SS" in UTC — recorded in applied_at.
+    private static string NowUtc() {
+        var out: string = ""
+        @c {
+            time_t t = time(NULL);
+            struct tm g;
+            gmtime_r(&t, &g);
+            char buf[32];
+            strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &g);
+            char* s = (char*) GC_MALLOC(32);
+            memcpy(s, buf, 32);
+            out = s;
+        }
+        return out
+    }
+}

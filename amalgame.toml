@@ -1,0 +1,29 @@
+# amalgame-database-migrate — schema migration runner for SQLite.
+#
+# Register ordered migrations (up + optional down SQL); the runner
+# tracks applied versions in a `schema_migrations` table and brings
+# the database forward / back one transaction at a time, stopping on
+# the first failure so the schema never half-applies.
+#
+# Install:
+#   amc package add database-sqlite
+#   amc package add database-migrate
+
+[package]
+name              = "amalgame-database-migrate"
+version           = "0.1.0"
+license           = "Apache-2.0"
+description       = "Schema migration runner for amalgame-database-sqlite: register ordered migrations (up + optional down SQL) and the Migrator brings the database forward (Up) or back (Down/DownTo) one transaction at a time, tracking applied versions in a schema_migrations table. SAFETY-first: migrations run in ascending version order regardless of registration order; each runs in its OWN transaction and the first error rolls back + STOPS so the schema never half-applies; already-applied versions are skipped (Up is idempotent); a down rollback refuses any migration that declared no down SQL (irreversible steps must be explicit); duplicate versions are rejected; the tracking-table name is validated as a plain identifier and the applied-version record is written with bound parameters. Current()/Pending() introspect the schema state."
+authors           = ["Bastien Mouget"]
+required-amalgame = ">=0.8.72"
+schema-version    = 1
+
+[dependencies]
+amalgame-database-sqlite = ">=0.4.0"
+
+[stdlib]
+classes   = ["Migration", "MigrateResult", "Migrator"]
+namespace = "Amalgame.Database.Migrate"
+header    = "facade-stub.h"
+facade    = "facade.am"
+libs      = []

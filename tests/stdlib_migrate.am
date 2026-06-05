@@ -1,0 +1,136 @@
+// Test sample for amalgame-database-migrate. Drives a real in-memory
+// SQLite database through Up / Down / DownTo and the safety paths.
+
+namespace UserApp
+
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Database.SQLite
+import Amalgame.Database.Migrate
+
+public class Program {
+    public static void Main() {
+        Console.WriteLine("amalgame-database-migrate — tests")
+
+        let db = SQLite.Open(":memory:")
+        if (!SQLite.IsOpen(db)) {
+            Console.WriteLine("[FAIL] open memory: " + SQLite.LastError(db))
+            return
+        }
+
+        // ── 1. Up applies all migrations in order ────────────
+        let m = new Migrator()
+        m.Add(2, "add_users_name",
+              "ALTER TABLE users ADD COLUMN name TEXT", "")
+        m.Add(1, "create_users",
+              "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE)",
+              "DROP TABLE users")
+        m.Add(3, "create_posts",
+              "CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER)",
+              "DROP TABLE posts")
+        let r1 = m.Up(db)
+        // Registered out of order (2,1,3) but applied 1,2,3.
+        if (r1.Ok && r1.Applied.Count() == 3
+            && r1.Applied.Get(0) == 1 && r1.Applied.Get(2) == 3) {
+            Console.WriteLine("[PASS] up applies all in ascending order")
+        } else {
+            Console.WriteLine("[FAIL] up: " + r1.Error + " applied=" + String_FromInt(r1.Applied.Count()))
+        }
+
+        // ── 2. Current version + the schema really exists ────
+        let cur1: int = m.Current(db)
+        let okInsert: bool = SQLite.Exec(db,
+            "INSERT INTO users (email, name) VALUES ('a@b.co', 'Alice')")
+        if (cur1 == 3 && okInsert) {
+            Console.WriteLine("[PASS] current=3 and migrated schema usable")
+        } else {
+            Console.WriteLine("[FAIL] current/schema: cur=" + String_FromInt(cur1) + " ins=" + SQLite.LastError(db))
+        }
+
+        // ── 3. Re-running Up is a no-op (idempotent) ─────────
+        let r3 = m.Up(db)
+        if (r3.Ok && r3.Applied.Count() == 0) {
+            Console.WriteLine("[PASS] re-run up applies nothing (idempotent)")
+        } else {
+            Console.WriteLine("[FAIL] idempotent up: applied=" + String_FromInt(r3.Applied.Count()))
+        }
+
+        // ── 4. Pending is empty when fully migrated ──────────
+        if (m.Pending(db).Count() == 0) {
+            Console.WriteLine("[PASS] pending empty when up to date")
+        } else {
+            Console.WriteLine("[FAIL] pending not empty")
+        }
+
+        // ── 5. Down rolls back the most recent (reversible) ──
+        let rd = m.Down(db)
+        let cur2: int = m.Current(db)
+        // posts (v3) had a down → dropped; v2/v1 remain.
+        let postsGone: bool = !SQLite.Exec(db, "INSERT INTO posts (user_id) VALUES (1)")
+        if (rd.Ok && cur2 == 2 && postsGone) {
+            Console.WriteLine("[PASS] down rolls back v3 (table dropped)")
+        } else {
+            Console.WriteLine("[FAIL] down: " + rd.Error + " cur=" + String_FromInt(cur2))
+        }
+
+        // ── 6. SAFETY: Down refuses an irreversible migration ─
+        // v2 declared no down SQL — must refuse, leave schema intact.
+        let rd2 = m.Down(db)
+        let cur3: int = m.Current(db)
+        if (!rd2.Ok && String_IndexOf(rd2.Error, "irreversible") >= 0 && cur3 == 2) {
+            Console.WriteLine("[PASS] down refuses irreversible migration")
+        } else {
+            Console.WriteLine("[FAIL] irreversible not refused: " + rd2.Error + " cur=" + String_FromInt(cur3))
+        }
+
+        // ── 7. SAFETY: a failing migration rolls back + stops ─
+        // Fresh DB. v1 ok, v2 has bad SQL, v3 would be fine. After Up,
+        // only v1 must be applied and v2's partial work undone.
+        let db2 = SQLite.Open(":memory:")
+        let bad = new Migrator()
+        bad.Add(1, "ok",   "CREATE TABLE a (id INTEGER PRIMARY KEY)", "DROP TABLE a")
+        bad.Add(2, "boom", "CREATE TABLE b (id INTEGER PRIMARY KEY); INSERT INTO nope VALUES (1)", "DROP TABLE b")
+        bad.Add(3, "never","CREATE TABLE c (id INTEGER PRIMARY KEY)", "DROP TABLE c")
+        let rb = bad.Up(db2)
+        let curB: int = bad.Current(db2)
+        // 'b' must NOT exist (transaction rolled back), 'c' never ran.
+        let bAbsent: bool = !SQLite.Exec(db2, "INSERT INTO b VALUES (1)")
+        let cAbsent: bool = !SQLite.Exec(db2, "INSERT INTO c VALUES (1)")
+        if (!rb.Ok && curB == 1 && bAbsent && cAbsent
+            && String_IndexOf(rb.Error, "v2") >= 0) {
+            Console.WriteLine("[PASS] failing migration rolls back + stops (no drift)")
+        } else {
+            Console.WriteLine("[FAIL] failure handling: ok=" + (rb.Ok ? "T" : "F")
+                + " cur=" + String_FromInt(curB) + " err=" + rb.Error)
+        }
+
+        // ── 8. SAFETY: duplicate versions rejected ───────────
+        let db3 = SQLite.Open(":memory:")
+        let dup = new Migrator()
+        dup.Add(1, "x", "CREATE TABLE x (id INTEGER PRIMARY KEY)", "")
+        dup.Add(1, "y", "CREATE TABLE y (id INTEGER PRIMARY KEY)", "")
+        let rdup = dup.Up(db3)
+        if (!rdup.Ok && String_IndexOf(rdup.Error, "duplicate") >= 0) {
+            Console.WriteLine("[PASS] duplicate version rejected")
+        } else {
+            Console.WriteLine("[FAIL] duplicate not rejected: " + rdup.Error)
+        }
+
+        // ── 9. DownTo rolls back several to a target ─────────
+        let db4 = SQLite.Open(":memory:")
+        let mm = new Migrator()
+        mm.Add(1, "t1", "CREATE TABLE t1 (id INTEGER PRIMARY KEY)", "DROP TABLE t1")
+        mm.Add(2, "t2", "CREATE TABLE t2 (id INTEGER PRIMARY KEY)", "DROP TABLE t2")
+        mm.Add(3, "t3", "CREATE TABLE t3 (id INTEGER PRIMARY KEY)", "DROP TABLE t3")
+        mm.Up(db4)
+        let rdt = mm.DownTo(db4, 1)
+        if (rdt.Ok && mm.Current(db4) == 1 && rdt.RolledBack.Count() == 2) {
+            Console.WriteLine("[PASS] downTo target rolls back the rest")
+        } else {
+            Console.WriteLine("[FAIL] downTo: cur=" + String_FromInt(mm.Current(db4))
+                + " back=" + String_FromInt(rdt.RolledBack.Count()))
+        }
+
+        Console.WriteLine("done")
+    }
+}

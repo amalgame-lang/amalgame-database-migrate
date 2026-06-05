@@ -1,0 +1,7 @@
+*.o
+*.c
+!facade.am
+test
+_test.am
+amalgame.lock
+/build/
